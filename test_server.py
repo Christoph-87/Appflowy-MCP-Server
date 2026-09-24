@@ -502,24 +502,35 @@ def test_update_row_cells_raises_when_write_never_confirms(monkeypatch):
 
 
 def _mock_http(monkeypatch, handler):
-    """Point server.httpx.Client at a MockTransport and stub auth.
+    """Point server httpx clients at a MockTransport and stub auth.
 
-    NOTE: `server.httpx` IS the global httpx module, so patching `.Client` here is a
-    global patch. Capture the pristine class from the *class* object rather than the
-    module attribute, or a second call in the same test would wrap the first mock
-    (and keep serving the first handler) instead of replacing it.
+    NOTE: `server.httpx` IS the global httpx module, so patching `.Client` or
+    `.AsyncClient` here is a global patch. Capture pristine classes before patching, or
+    a second call in the same test would wrap the first mock instead of replacing it.
     """
     import httpx
 
     real_client = _PRISTINE_HTTPX_CLIENT
+    real_async_client = _PRISTINE_HTTPX_ASYNC_CLIENT
     monkeypatch.setattr(
         server.httpx,
         "Client",
         lambda **k: real_client(transport=httpx.MockTransport(handler)),
     )
     monkeypatch.setattr(
-        server, "get_auth_headers", lambda: {"Authorization": "Bearer x"}
+        server.httpx,
+        "AsyncClient",
+        lambda **k: real_async_client(transport=httpx.MockTransport(handler)),
     )
+
+    def sync_auth_headers():
+        return {"Authorization": "Bearer x"}
+
+    async def auth_headers():
+        return {"Authorization": "Bearer x"}
+
+    monkeypatch.setattr(server, "get_auth_headers", sync_auth_headers)
+    monkeypatch.setattr(server, "get_auth_headers_async", auth_headers)
 
 
 def _pristine_httpx_client():
@@ -528,7 +539,14 @@ def _pristine_httpx_client():
     return httpx.Client
 
 
+def _pristine_httpx_async_client():
+    import httpx
+
+    return httpx.AsyncClient
+
+
 _PRISTINE_HTTPX_CLIENT = _pristine_httpx_client()
+_PRISTINE_HTTPX_ASYNC_CLIENT = _pristine_httpx_async_client()
 
 
 def test_is_database_row_discriminates_row_from_document(monkeypatch):
@@ -620,15 +638,17 @@ def test_api_call_actionable_error(monkeypatch):
     def handler(_request):
         return httpx.Response(404, text="object not found")
 
-    real_client = httpx.Client  # capture before patching to avoid recursion
+    real_client = _PRISTINE_HTTPX_CLIENT
     monkeypatch.setattr(
         server.httpx,
         "Client",
         lambda **k: real_client(transport=httpx.MockTransport(handler)),
     )
-    monkeypatch.setattr(
-        server, "get_auth_headers", lambda: {"Authorization": "Bearer x"}
-    )
+
+    def auth_headers():
+        return {"Authorization": "Bearer x"}
+
+    monkeypatch.setattr(server, "get_auth_headers", auth_headers)
 
     with pytest.raises(RuntimeError) as ei:
         server._api_call("GET", "/api/workspace/x/database/y/fields")
@@ -671,6 +691,128 @@ def test_api_call_accepts_success_envelope_and_empty_response(monkeypatch):
         server._api_call("POST", "/api/workspace/w/collab/d/web-update").status_code
         == 204
     )
+
+
+def test_api_call_sync_path_works_inside_running_event_loop(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    def handler(_request):
+        return httpx.Response(204)
+
+    _mock_http(monkeypatch, handler)
+
+    async def run_inside_loop():
+        return server._api_call("POST", "/api/workspace/w/collab/d/web-update")
+
+    assert asyncio.run(run_inside_loop()).status_code == 204
+
+
+def test_async_auth_headers_serializes_concurrent_login(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(server, "_access_token", None)
+    monkeypatch.setattr(server, "_refresh_token", None)
+    monkeypatch.setattr(server, "_token_expires_at", 0)
+    calls = {"login": 0}
+
+    async def fake_login():
+        calls["login"] += 1
+        await asyncio.sleep(0)
+        server._access_token = "token"
+        server._refresh_token = "refresh"
+        server._token_expires_at = server.time.time() + 3600
+
+    monkeypatch.setattr(server, "_login_async", fake_login)
+
+    async def concurrent_headers():
+        return await asyncio.gather(
+            *(server.get_auth_headers_async() for _ in range(5))
+        )
+
+    headers = asyncio.run(concurrent_headers())
+
+    assert calls["login"] == 1
+    assert {header["Authorization"] for header in headers} == {"Bearer token"}
+
+
+def test_async_api_call_reuses_shared_client(monkeypatch):
+    import asyncio
+
+    import httpx
+
+    monkeypatch.setattr(server, "_async_client", None)
+    created = {"count": 0}
+
+    def handler(_request):
+        return httpx.Response(204)
+
+    real_async_client = _PRISTINE_HTTPX_ASYNC_CLIENT
+
+    def fake_async_client(**_kwargs):
+        created["count"] += 1
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(server.httpx, "AsyncClient", fake_async_client)
+
+    async def auth_headers():
+        return {"Authorization": "Bearer x"}
+
+    monkeypatch.setattr(server, "get_auth_headers_async", auth_headers)
+
+    async def call_twice():
+        first = await server._api_call_async(
+            "POST", "/api/workspace/w/collab/d/web-update"
+        )
+        second = await server._api_call_async(
+            "POST", "/api/workspace/w/collab/d/web-update"
+        )
+        await server._close_async_client()
+        return first.status_code, second.status_code
+
+    assert asyncio.run(call_twice()) == (204, 204)
+    assert created["count"] == 1
+
+
+def test_stdio_runner_closes_async_client(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    async def fake_run_stdio_async():
+        calls.append("run")
+
+    async def fake_close_async_client():
+        calls.append("close")
+
+    monkeypatch.setattr(server.mcp, "run_stdio_async", fake_run_stdio_async)
+    monkeypatch.setattr(server, "_close_async_client", fake_close_async_client)
+
+    asyncio.run(server._run_stdio_with_lifecycle())
+
+    assert calls == ["run", "close"]
+
+
+def test_stdio_runner_closes_async_client_after_error(monkeypatch):
+    import asyncio
+
+    calls = []
+
+    async def fake_run_stdio_async():
+        calls.append("run")
+        raise RuntimeError("boom")
+
+    async def fake_close_async_client():
+        calls.append("close")
+
+    monkeypatch.setattr(server.mcp, "run_stdio_async", fake_run_stdio_async)
+    monkeypatch.setattr(server, "_close_async_client", fake_close_async_client)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        asyncio.run(server._run_stdio_with_lifecycle())
+
+    assert calls == ["run", "close"]
 
 
 def test_oauth_store_persists_across_instances(tmp_path):

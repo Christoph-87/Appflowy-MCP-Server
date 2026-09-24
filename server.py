@@ -21,6 +21,7 @@ Security model (see README/SECURITY):
     whole link like a password.
 """
 
+import asyncio
 import base64
 import hmac
 import json
@@ -29,6 +30,7 @@ import os
 import re
 import secrets
 import string
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -240,6 +242,9 @@ if os.environ.get("GOOGLE_CLIENT_ID") and OAUTH_ISSUER:
 _access_token = None
 _refresh_token = None
 _token_expires_at = 0
+_token_lock = threading.Lock()
+_async_auth_lock = asyncio.Lock()
+_async_client: httpx.AsyncClient | None = None
 
 
 def _allowed_workspaces() -> set[str] | None:
@@ -257,6 +262,42 @@ def _require_workspace(workspace_id: str) -> None:
         )
 
 
+async def _get_async_client() -> httpx.AsyncClient:
+    global _async_client
+    if _async_client is None or _async_client.is_closed:
+        _async_client = httpx.AsyncClient(timeout=30.0)
+    return _async_client
+
+
+async def _close_async_client() -> None:
+    global _async_client
+    if _async_client is not None and not _async_client.is_closed:
+        await _async_client.aclose()
+    _async_client = None
+
+
+async def _login_async() -> None:
+    global _access_token, _refresh_token, _token_expires_at
+    email = os.environ.get("APPFLOWY_EMAIL")
+    password = os.environ.get("APPFLOWY_PASSWORD")
+
+    if not email or not password:
+        raise ValueError("APPFLOWY_EMAIL and APPFLOWY_PASSWORD must be set.")
+
+    url = f"{BASE_URL}/gotrue/token?grant_type=password"
+    data = {"email": email, "password": password}
+
+    client = await _get_async_client()
+    res = await client.post(url, json=data, headers={"User-Agent": USER_AGENT})
+    res.raise_for_status()
+
+    body = res.json()
+    _access_token = body.get("access_token")
+    _refresh_token = body.get("refresh_token")
+    expires_in = body.get("expires_in", 3600)
+    _token_expires_at = time.time() + expires_in - 60  # 60s buffer
+
+
 def _login() -> None:
     global _access_token, _refresh_token, _token_expires_at
     email = os.environ.get("APPFLOWY_EMAIL")
@@ -268,15 +309,38 @@ def _login() -> None:
     url = f"{BASE_URL}/gotrue/token?grant_type=password"
     data = {"email": email, "password": password}
 
-    with httpx.Client() as client:
+    with httpx.Client(timeout=30.0) as client:
         res = client.post(url, json=data, headers={"User-Agent": USER_AGENT})
         res.raise_for_status()
 
-        body = res.json()
-        _access_token = body.get("access_token")
+    body = res.json()
+    _access_token = body.get("access_token")
+    _refresh_token = body.get("refresh_token")
+    expires_in = body.get("expires_in", 3600)
+    _token_expires_at = time.time() + expires_in - 60  # 60s buffer
+
+
+async def _refresh_async() -> None:
+    global _access_token, _refresh_token, _token_expires_at
+    if not _refresh_token:
+        await _login_async()
+        return
+
+    url = f"{BASE_URL}/gotrue/token?grant_type=refresh_token"
+    data = {"refresh_token": _refresh_token}
+
+    client = await _get_async_client()
+    res = await client.post(url, json=data, headers={"User-Agent": USER_AGENT})
+    if res.status_code != 200:
+        await _login_async()  # refresh token expired -> re-login
+        return
+
+    body = res.json()
+    _access_token = body.get("access_token")
+    if body.get("refresh_token"):
         _refresh_token = body.get("refresh_token")
-        expires_in = body.get("expires_in", 3600)
-        _token_expires_at = time.time() + expires_in - 60  # 60s buffer
+    expires_in = body.get("expires_in", 3600)
+    _token_expires_at = time.time() + expires_in - 60
 
 
 def _refresh() -> None:
@@ -288,27 +352,46 @@ def _refresh() -> None:
     url = f"{BASE_URL}/gotrue/token?grant_type=refresh_token"
     data = {"refresh_token": _refresh_token}
 
-    with httpx.Client() as client:
+    with httpx.Client(timeout=30.0) as client:
         res = client.post(url, json=data, headers={"User-Agent": USER_AGENT})
         if res.status_code != 200:
             _login()  # refresh token expired -> re-login
             return
 
-        body = res.json()
-        _access_token = body.get("access_token")
-        if body.get("refresh_token"):
-            _refresh_token = body.get("refresh_token")
-        expires_in = body.get("expires_in", 3600)
-        _token_expires_at = time.time() + expires_in - 60
+    body = res.json()
+    _access_token = body.get("access_token")
+    if body.get("refresh_token"):
+        _refresh_token = body.get("refresh_token")
+    expires_in = body.get("expires_in", 3600)
+    _token_expires_at = time.time() + expires_in - 60
+
+
+async def get_auth_headers_async() -> dict:
+    if not _access_token or time.time() >= _token_expires_at:
+        async with _async_auth_lock:
+            if not _access_token or time.time() >= _token_expires_at:
+                try:
+                    await _refresh_async() if _refresh_token else await _login_async()
+                except Exception:  # noqa: BLE001 - any refresh failure (expired/revoked/
+                    # malformed token, transport error) is recoverable by a full re-login.
+                    await _login_async()
+
+    return {
+        "Authorization": f"Bearer {_access_token}",
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/json",
+    }
 
 
 def get_auth_headers() -> dict:
     if not _access_token or time.time() >= _token_expires_at:
-        try:
-            _refresh() if _refresh_token else _login()
-        except Exception:  # noqa: BLE001 - any refresh failure (expired/revoked/
-            # malformed token, transport error) is recoverable by a full re-login.
-            _login()
+        with _token_lock:
+            if not _access_token or time.time() >= _token_expires_at:
+                try:
+                    _refresh() if _refresh_token else _login()
+                except Exception:  # noqa: BLE001 - any refresh failure (expired/revoked/
+                    # malformed token, transport error) is recoverable by a full re-login.
+                    _login()
 
     return {
         "Authorization": f"Bearer {_access_token}",
@@ -330,10 +413,57 @@ _ERROR_HINTS = {
 }
 
 
-def _api_call(method: str, path: str, **kwargs) -> httpx.Response:
+def _raise_appflowy_application_error(payload, path: str) -> None:
+    if not isinstance(payload, dict) or not isinstance(payload.get("code"), int):
+        return
+    code = payload["code"]
+    if code == 0:
+        return
+    message = " ".join(str(payload.get("message", "Request failed"))[:200].split())
+    hint = (
+        "check that database_id is the actual database ID, not a view_id "
+        "(call list_databases)"
+        if code == 1012 and "/database/" in path
+        else "check the request and resource permissions"
+    )
+    raise RuntimeError(f"AppFlowy API code {code}: {message}; {hint}.")
+
+
+async def _api_call_async(method: str, path: str, **kwargs) -> httpx.Response:
     """Authenticated AppFlowy API call with actionable errors. `path` is joined to
     BASE_URL. Raises RuntimeError with a specific, agent-readable message on failure so a
     tool error tells the agent how to fix its call rather than dumping a raw traceback."""
+    try:
+        client = await _get_async_client()
+        res = await client.request(
+            method,
+            f"{BASE_URL}{path}",
+            headers=await get_auth_headers_async(),
+            **kwargs,
+        )
+        res.raise_for_status()
+        # AppFlowy can report an application error inside HTTP 200. In particular,
+        # row writes with a view_id in place of database_id return code 1012 without
+        # an HTTP error status.
+        try:
+            payload = res.json()
+        except ValueError:
+            payload = None
+        _raise_appflowy_application_error(payload, path)
+        return res
+    except httpx.HTTPStatusError as e:
+        code = e.response.status_code
+        hint = _ERROR_HINTS.get(code, "unexpected AppFlowy API error")
+        body = " ".join(e.response.text[:200].split())
+        raise RuntimeError(f"AppFlowy API {code}: {hint}. Server said: {body}") from e
+    except httpx.RequestError as e:
+        raise RuntimeError(
+            f"AppFlowy API request did not complete ({type(e).__name__}) — retry shortly"
+        ) from e
+
+
+def _api_call(method: str, path: str, **kwargs) -> httpx.Response:
+    """Synchronous v1 API path; safe to call even if the caller owns an event loop."""
     try:
         with httpx.Client(timeout=30.0) as client:
             res = client.request(
@@ -347,19 +477,7 @@ def _api_call(method: str, path: str, **kwargs) -> httpx.Response:
                 payload = res.json()
             except ValueError:
                 payload = None
-            if isinstance(payload, dict) and isinstance(payload.get("code"), int):
-                code = payload["code"]
-                if code != 0:
-                    message = " ".join(
-                        str(payload.get("message", "Request failed"))[:200].split()
-                    )
-                    hint = (
-                        "check that database_id is the actual database ID, not a view_id "
-                        "(call list_databases)"
-                        if code == 1012 and "/database/" in path
-                        else "check the request and resource permissions"
-                    )
-                    raise RuntimeError(f"AppFlowy API code {code}: {message}; {hint}.")
+            _raise_appflowy_application_error(payload, path)
             return res
     except httpx.HTTPStatusError as e:
         code = e.response.status_code
@@ -1957,7 +2075,10 @@ _sse_app = mcp.sse_app()
 async def lifespan(_: FastAPI):
     # Streamable HTTP needs its session manager running for the app's lifetime.
     async with mcp.session_manager.run():
-        yield
+        try:
+            yield
+        finally:
+            await _close_async_client()
 
 
 class _RedactTokenFilter(logging.Filter):
@@ -2090,6 +2211,19 @@ app.mount("/mcp", _streamable_app)
 app.mount("/sse", _sse_app)
 
 
+async def _run_stdio_with_lifecycle() -> None:
+    """Run stdio with the same async-client cleanup guarantee as HTTP.
+
+    FastAPI lifespan hooks do not run for local stdio usage, so the reusable
+    async client needs a process-level finally block there as well.
+    """
+
+    try:
+        await mcp.run_stdio_async()
+    finally:
+        await _close_async_client()
+
+
 if __name__ == "__main__":
     # Run directly for local use over stdio.
-    mcp.run(transport="stdio")
+    asyncio.run(_run_stdio_with_lifecycle())
