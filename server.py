@@ -35,6 +35,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Annotated, Literal
 
 import httpx
 from dotenv import load_dotenv
@@ -46,6 +47,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from mdit_py_plugins.dollarmath import dollarmath_plugin
 from pycrdt import Array, Doc, Map, Text
+from pydantic import BaseModel, Field, ValidationError
 
 # Load environment variables
 env_path = Path(__file__).parent / ".env"
@@ -260,6 +262,24 @@ def _require_workspace(workspace_id: str) -> None:
             f"Workspace '{workspace_id}' is not permitted by this server's "
             "ALLOWED_WORKSPACE_IDS policy."
         )
+
+
+def _default_workspace_id(workspace_id: str = "") -> str:
+    """Return an explicit workspace id, or infer it from a single allowed workspace.
+
+    v2 read verbs should be ergonomic for single-workspace deployments while staying
+    explicit for multi-workspace servers. If ALLOWED_WORKSPACE_IDS contains exactly one
+    id, callers may omit workspace_id; otherwise they must pass it.
+    """
+    if workspace_id:
+        _require_workspace(workspace_id)
+        return workspace_id
+    allowed = _allowed_workspaces()
+    if allowed is not None and len(allowed) == 1:
+        return next(iter(allowed))
+    raise ValueError(
+        "workspace_id is required unless ALLOWED_WORKSPACE_IDS contains exactly one id"
+    )
 
 
 async def _get_async_client() -> httpx.AsyncClient:
@@ -548,6 +568,18 @@ def _collab_doc(workspace_id: str, object_id: str, collab_type: int) -> Doc:
     return doc
 
 
+async def _collab_doc_async(workspace_id: str, object_id: str, collab_type: int) -> Doc:
+    """Fetch a collab object with the async API client and load it into a pycrdt Doc."""
+    res = await _api_call_async(
+        "GET",
+        f"/api/workspace/v1/{workspace_id}/collab/{object_id}",
+        params={"collab_type": collab_type},
+    )
+    doc = Doc()
+    doc.apply_update(_collab_doc_state(res.json()))
+    return doc
+
+
 def _collab_web_update(
     workspace_id: str, object_id: str, doc: Doc, state_vector: bytes, collab_type: int
 ) -> None:
@@ -624,6 +656,27 @@ def _open_document(workspace_id: str, page_id: str):
         doc = _collab_doc(workspace_id, page_id, 0)
         root = doc.get("data", type=Map)
     return doc, page_id, root["document"]
+
+
+async def _open_document_async(workspace_id: str, page_id: str):
+    """Async equivalent of _open_document for v2 read helpers."""
+    root = None
+    try:
+        doc = await _collab_doc_async(workspace_id, page_id, 0)
+        root = doc.get("data", type=Map)
+    except RuntimeError:
+        pass
+    if root is None or "document" not in root:
+        page_id = _row_document_id(page_id)
+        doc = await _collab_doc_async(workspace_id, page_id, 0)
+        root = doc.get("data", type=Map)
+    return doc, page_id, root["document"]
+
+
+async def get_page_markdown_async(workspace_id: str, page_id: str) -> str:
+    _require_workspace(workspace_id)
+    _, _, document = await _open_document_async(workspace_id, page_id)
+    return _doc_to_markdown(document)
 
 
 def _open_database(workspace_id: str, database_id: str):
@@ -1733,6 +1786,286 @@ def get_page_markdown(workspace_id: str, page_id: str) -> str:
     _require_workspace(workspace_id)
     _, _, document = _open_document(workspace_id, page_id)
     return _doc_to_markdown(document)
+
+
+APPFLOWY_FETCH_MAX_DEPTH = 5
+APPFLOWY_FETCH_MAX_LIMIT = 100
+APPFLOWY_FETCH_MAX_FOLDER_NODES = 250
+APPFLOWY_FETCH_MAX_MARKDOWN_CHARS = 50_000
+
+AppFlowyFetchKind = Literal[
+    "auto", "self", "workspaces", "workspace_folder", "database_fields", "page"
+]
+AppFlowyFetchResponseFormat = Literal["json", "markdown"]
+AppFlowyFetchDepth = Annotated[int, Field(ge=0, le=APPFLOWY_FETCH_MAX_DEPTH)]
+AppFlowyFetchLimit = Annotated[int, Field(ge=1, le=APPFLOWY_FETCH_MAX_LIMIT)]
+AppFlowyFetchOffset = Annotated[int, Field(ge=0)]
+AppFlowyFetchFolderNodeLimit = Annotated[
+    int, Field(ge=1, le=APPFLOWY_FETCH_MAX_FOLDER_NODES)
+]
+AppFlowyFetchMarkdownLimit = Annotated[
+    int, Field(ge=1, le=APPFLOWY_FETCH_MAX_MARKDOWN_CHARS)
+]
+
+
+class AppFlowyFetchInput(BaseModel):
+    id: str = "self"
+    kind: AppFlowyFetchKind = "auto"
+    workspace_id: str = ""
+    response_format: AppFlowyFetchResponseFormat = "json"
+    depth: AppFlowyFetchDepth = 1
+    database_id: str = ""
+    limit: AppFlowyFetchLimit = 50
+    offset: AppFlowyFetchOffset = 0
+    max_folder_nodes: AppFlowyFetchFolderNodeLimit = 100
+    max_markdown_chars: AppFlowyFetchMarkdownLimit = 20_000
+
+
+def _fetch_envelope(
+    *,
+    kind: str,
+    data,
+    workspace_id: str = "",
+    id: str = "",
+    limit: int | None = None,
+    offset: int = 0,
+    total_count: int | None = None,
+    truncated: bool = False,
+    next_offset: int | None = None,
+    **extra,
+) -> dict:
+    out = {"kind": kind, "data": data}
+    if workspace_id:
+        out["workspace_id"] = workspace_id
+    if id:
+        out["id"] = id
+    out["truncated"] = truncated
+    if limit is not None:
+        out["limit"] = limit
+        out["offset"] = offset
+        out["total_count"] = total_count if total_count is not None else len(data)
+        computed_next = offset + len(data)
+        out["has_more"] = next_offset is not None
+        out["next_offset"] = next_offset
+        out["returned_count"] = len(data)
+        if (
+            next_offset is None
+            and total_count is not None
+            and computed_next < total_count
+        ):
+            out["has_more"] = True
+            out["next_offset"] = computed_next
+    out.update({k: v for k, v in extra.items() if v is not None})
+    return out
+
+
+def _paginate(items: list, *, limit: int, offset: int) -> tuple[list, int | None]:
+    total = len(items)
+    page = items[offset : offset + limit]
+    next_offset = offset + len(page) if offset + len(page) < total else None
+    return page, next_offset
+
+
+def _bound_folder_tree(tree, *, max_nodes: int) -> tuple[object, bool, int]:
+    seen = 0
+    truncated = False
+
+    def visit(value):
+        nonlocal seen, truncated
+        if seen >= max_nodes:
+            truncated = True
+            return None
+        if isinstance(value, dict):
+            seen += 1
+            out = {}
+            for key, child in value.items():
+                bounded = visit(child)
+                if bounded is not None or child is None:
+                    out[key] = bounded
+                if truncated:
+                    break
+            return out
+        if isinstance(value, list):
+            out = []
+            for child in value:
+                bounded = visit(child)
+                if bounded is not None or child is None:
+                    out.append(bounded)
+                if truncated:
+                    break
+            return out
+        return value
+
+    return visit(tree), truncated, seen
+
+
+async def appflowy_fetch(
+    id: str = "self",
+    kind: AppFlowyFetchKind = "auto",
+    workspace_id: str = "",
+    response_format: AppFlowyFetchResponseFormat = "json",
+    depth: AppFlowyFetchDepth = 1,
+    database_id: str = "",
+    limit: AppFlowyFetchLimit = 50,
+    offset: AppFlowyFetchOffset = 0,
+    max_folder_nodes: AppFlowyFetchFolderNodeLimit = 100,
+    max_markdown_chars: AppFlowyFetchMarkdownLimit = 20_000,
+) -> dict:
+    """v2 read verb for small, common fetches.
+
+    Examples:
+      * appflowy_fetch(id="self") -> visible workspaces
+      * appflowy_fetch(kind="workspace_folder", workspace_id="...") -> folder tree
+      * appflowy_fetch(id="page-view-id", response_format="markdown") -> page content
+      * appflowy_fetch(kind="database_fields", workspace_id="...", database_id="...")
+
+    This intentionally starts narrow: search and row pagination get their own v2
+    verbs/commands, while this covers identity, folders, page metadata/content, and
+    database field metadata without exposing old CRDT internals.
+    """
+    try:
+        params = AppFlowyFetchInput(
+            id=id,
+            kind=kind.lower(),
+            workspace_id=workspace_id,
+            response_format=response_format.lower(),
+            depth=depth,
+            database_id=database_id,
+            limit=limit,
+            offset=offset,
+            max_folder_nodes=max_folder_nodes,
+            max_markdown_chars=max_markdown_chars,
+        )
+    except ValidationError as exc:
+        raise ValueError(str(exc)) from exc
+
+    id = params.id
+    kind = params.kind
+    workspace_id = params.workspace_id
+    response_format = params.response_format
+    depth = params.depth
+    database_id = params.database_id
+    limit = params.limit
+    offset = params.offset
+    max_folder_nodes = params.max_folder_nodes
+    max_markdown_chars = params.max_markdown_chars
+
+    if kind == "auto":
+        if id == "self":
+            kind = "self"
+        elif database_id:
+            kind = "database_fields"
+        else:
+            kind = "page"
+
+    if kind in {"self", "workspaces"}:
+        data = (await _api_call_async("GET", "/api/workspace")).json().get("data", [])
+        allowed = _allowed_workspaces()
+        if allowed is not None:
+            data = [
+                w for w in data if (w.get("workspace_id") or w.get("id")) in allowed
+            ]
+        total_count = len(data)
+        page, next_offset = _paginate(data, limit=limit, offset=offset)
+        return _fetch_envelope(
+            kind="workspaces",
+            data=page,
+            limit=limit,
+            offset=offset,
+            total_count=total_count,
+            next_offset=next_offset,
+        )
+
+    workspace_id = _default_workspace_id(workspace_id)
+
+    if kind == "workspace_folder":
+        tree = (
+            (
+                await _api_call_async(
+                    "GET",
+                    f"/api/workspace/{workspace_id}/folder",
+                    params={"depth": depth},
+                )
+            )
+            .json()
+            .get("data", {})
+        )
+        bounded_tree, truncated, nodes_visited = _bound_folder_tree(
+            tree, max_nodes=max_folder_nodes
+        )
+        return _fetch_envelope(
+            kind="workspace_folder",
+            workspace_id=workspace_id,
+            data=bounded_tree,
+            truncated=truncated,
+            depth=depth,
+            max_folder_nodes=max_folder_nodes,
+            nodes_visited=nodes_visited,
+        )
+
+    if kind == "database_fields":
+        if not database_id:
+            database_id = id if id != "self" else ""
+        if not database_id:
+            raise ValueError("database_id is required for kind='database_fields'")
+        data = (
+            (
+                await _api_call_async(
+                    "GET",
+                    f"/api/workspace/{workspace_id}/database/{database_id}/fields",
+                )
+            )
+            .json()
+            .get("data", [])
+        )
+        total_count = len(data)
+        page, next_offset = _paginate(data, limit=limit, offset=offset)
+        return _fetch_envelope(
+            kind="database_fields",
+            workspace_id=workspace_id,
+            database_id=database_id,
+            data=page,
+            limit=limit,
+            offset=offset,
+            total_count=total_count,
+            next_offset=next_offset,
+        )
+
+    if kind == "page":
+        if not id or id == "self":
+            raise ValueError("id must be a page/view id for kind='page'")
+        if response_format == "markdown":
+            markdown = await get_page_markdown_async(workspace_id, id)
+            truncated = len(markdown) > max_markdown_chars
+            return _fetch_envelope(
+                kind="page",
+                workspace_id=workspace_id,
+                id=id,
+                data={
+                    "format": "markdown",
+                    "markdown": markdown[:max_markdown_chars],
+                },
+                truncated=truncated,
+                max_markdown_chars=max_markdown_chars,
+                total_chars=len(markdown),
+            )
+        return _fetch_envelope(
+            kind="page",
+            workspace_id=workspace_id,
+            id=id,
+            data=(
+                await _api_call_async(
+                    "GET", f"/api/workspace/{workspace_id}/page-view/{id}"
+                )
+            )
+            .json()
+            .get("data", {}),
+        )
+
+    raise ValueError(
+        "kind must be one of: auto, self, workspaces, workspace_folder, "
+        "database_fields, page"
+    )
 
 
 # Concurrent collab edits can transiently lose a write, so update_row_cells confirms

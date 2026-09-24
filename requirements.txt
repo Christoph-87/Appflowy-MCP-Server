@@ -6,6 +6,7 @@ fastapi
 mcp>=1.13,<2
 uvicorn
 httpx
+pydantic
 python-dotenv
 markdown-it-py
 mdit-py-plugins
