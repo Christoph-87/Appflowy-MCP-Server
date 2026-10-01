@@ -256,6 +256,253 @@ def test_section_helpers_can_target_nested_container_heading():
     assert "top level" in md
 
 
+def test_appflowy_export_single_page(monkeypatch):
+    import asyncio
+
+    async def fake_markdown(_workspace_id, _page_id):
+        return "# Exported"
+
+    monkeypatch.setattr(server, "get_page_markdown_async", fake_markdown)
+
+    out = asyncio.run(server.appflowy_export("ws-allowed", "page1"))
+
+    assert out == {
+        "entries": [{"path": "page1.md", "id": "page1", "markdown": "# Exported"}],
+        "warnings": [],
+        "warnings_truncated": False,
+        "has_more": False,
+    }
+
+
+def test_appflowy_export_child_tree_with_warnings(monkeypatch):
+    import asyncio
+
+    tree = {
+        "views": [
+            {
+                "view_id": "root",
+                "name": "Root/Page",
+                "children": [
+                    {"view_id": "child", "name": "Child"},
+                    {"view_id": "db", "name": "Database"},
+                ],
+            }
+        ]
+    }
+
+    async def fake_folder(*_a, **_k):
+        return tree
+
+    async def fake_markdown(_workspace_id, page_id):
+        if page_id == "db":
+            raise RuntimeError("not a document")
+        return f"# {page_id}"
+
+    monkeypatch.setattr(server, "get_workspace_folder_async", fake_folder)
+    monkeypatch.setattr(server, "get_page_markdown_async", fake_markdown)
+
+    out = asyncio.run(server.appflowy_export("ws-allowed", "root", depth=1))
+
+    assert out["entries"] == [
+        {"path": "Root-Page.md", "id": "root", "markdown": "# root"},
+        {"path": "Root-Page/Child.md", "id": "child", "markdown": "# child"},
+    ]
+    assert out["warnings"][0]["id"] == "db"
+    assert out["warnings"][0]["path"] == "Root-Page/Database.md"
+    assert out["warnings"][0]["type"] == "document_unavailable"
+    assert "not a document" not in str(out["warnings"][0])
+    assert out["has_more"] is False
+
+
+def test_appflowy_export_limit_sets_has_more(monkeypatch):
+    import asyncio
+
+    tree = {
+        "views": [
+            {
+                "view_id": "root",
+                "name": "Root",
+                "children": [{"view_id": "child", "name": "Child"}],
+            }
+        ]
+    }
+
+    async def fake_folder(*_a, **_k):
+        return tree
+
+    async def fake_markdown(_workspace_id, page_id):
+        return f"# {page_id}"
+
+    monkeypatch.setattr(server, "get_workspace_folder_async", fake_folder)
+    monkeypatch.setattr(server, "get_page_markdown_async", fake_markdown)
+
+    out = asyncio.run(server.appflowy_export("ws-allowed", "root", depth=1, limit=1))
+
+    assert out["entries"] == [{"path": "Root.md", "id": "root", "markdown": "# root"}]
+    assert out["has_more"] is True
+
+
+def test_appflowy_export_warns_when_tree_cannot_locate_target(monkeypatch):
+    import asyncio
+
+    async def fake_folder(*_a, **_k):
+        return {"views": []}
+
+    async def fake_markdown(_workspace_id, page_id):
+        return f"# {page_id}"
+
+    monkeypatch.setattr(server, "get_workspace_folder_async", fake_folder)
+    monkeypatch.setattr(server, "get_page_markdown_async", fake_markdown)
+
+    out = asyncio.run(server.appflowy_export("ws-allowed", "page1", depth=1))
+
+    assert out["entries"] == [
+        {"path": "page1.md", "id": "page1", "markdown": "# page1"}
+    ]
+    assert out["warnings"][0]["id"] == "page1"
+    assert out["warnings"][0]["type"] == "target_not_found"
+
+
+def test_appflowy_export_failed_child_consumes_limit(monkeypatch):
+    import asyncio
+
+    tree = {
+        "views": [
+            {
+                "view_id": "root",
+                "name": "Root",
+                "children": [
+                    {"view_id": "broken", "name": "Broken"},
+                    {"view_id": "after", "name": "After"},
+                ],
+            }
+        ]
+    }
+
+    async def fake_folder(*_a, **_k):
+        return tree
+
+    async def fake_markdown(_workspace_id, page_id):
+        if page_id == "broken":
+            raise RuntimeError("sensitive path /tmp/secret")
+        return f"# {page_id}"
+
+    monkeypatch.setattr(server, "get_workspace_folder_async", fake_folder)
+    monkeypatch.setattr(server, "get_page_markdown_async", fake_markdown)
+
+    out = asyncio.run(server.appflowy_export("ws-allowed", "root", depth=1, limit=2))
+
+    assert out["entries"] == [{"path": "Root.md", "id": "root", "markdown": "# root"}]
+    assert out["warnings"] == [
+        {
+            "message": "page could not be exported as Markdown",
+            "id": "broken",
+            "path": "Root/Broken.md",
+            "type": "document_unavailable",
+        }
+    ]
+    assert out["has_more"] is True
+
+
+def test_appflowy_export_does_not_queue_children_after_failed_parent(monkeypatch):
+    import asyncio
+
+    tree = {
+        "views": [
+            {
+                "view_id": "root",
+                "name": "Root",
+                "children": [
+                    {
+                        "view_id": "broken",
+                        "name": "Broken",
+                        "children": [{"view_id": "grandchild", "name": "Grandchild"}],
+                    }
+                ],
+            }
+        ]
+    }
+
+    async def fake_folder(*_a, **_k):
+        return tree
+
+    async def fake_markdown(_workspace_id, page_id):
+        if page_id == "broken":
+            raise RuntimeError("not a document")
+        if page_id == "grandchild":
+            raise AssertionError("grandchild should not be exported")
+        return f"# {page_id}"
+
+    monkeypatch.setattr(server, "get_workspace_folder_async", fake_folder)
+    monkeypatch.setattr(server, "get_page_markdown_async", fake_markdown)
+
+    out = asyncio.run(server.appflowy_export("ws-allowed", "root", depth=2))
+
+    assert out["entries"] == [{"path": "Root.md", "id": "root", "markdown": "# root"}]
+    assert [warning["id"] for warning in out["warnings"]] == ["broken"]
+
+
+def test_appflowy_export_duplicate_sibling_paths_keep_child_subtrees(monkeypatch):
+    import asyncio
+
+    tree = {
+        "views": [
+            {
+                "view_id": "root",
+                "name": "Root",
+                "children": [
+                    {
+                        "view_id": "same-1",
+                        "name": "Same",
+                        "children": [{"view_id": "child-1", "name": "Child"}],
+                    },
+                    {
+                        "view_id": "same-2",
+                        "name": "Same",
+                        "children": [{"view_id": "child-2", "name": "Child"}],
+                    },
+                ],
+            }
+        ]
+    }
+
+    async def fake_folder(*_a, **_k):
+        return tree
+
+    async def fake_markdown(_workspace_id, page_id):
+        return f"# {page_id}"
+
+    monkeypatch.setattr(server, "get_workspace_folder_async", fake_folder)
+    monkeypatch.setattr(server, "get_page_markdown_async", fake_markdown)
+
+    out = asyncio.run(server.appflowy_export("ws-allowed", "root", depth=2))
+
+    assert [entry["path"] for entry in out["entries"]] == [
+        "Root.md",
+        "Root/Same.md",
+        "Root/Same-2.md",
+        "Root/Same/Child.md",
+        "Root/Same-2/Child.md",
+    ]
+
+
+def test_appflowy_export_validates_bounds():
+    import asyncio
+
+    with pytest.raises(ValueError):
+        asyncio.run(
+            server.appflowy_export(
+                "ws-allowed", "page1", depth=server.APPFLOWY_EXPORT_MAX_DEPTH + 1
+            )
+        )
+    with pytest.raises(ValueError):
+        asyncio.run(
+            server.appflowy_export(
+                "ws-allowed", "page1", limit=server.APPFLOWY_EXPORT_MAX_LIMIT + 1
+            )
+        )
+
+
 def test_set_text_utf8_offsets_with_emoji():
     # pycrdt Text indexes by UTF-8 byte; a leading emoji (4 bytes) must not drift the
     # format range, or links/bold after it land on the wrong characters.

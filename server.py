@@ -790,6 +790,17 @@ def get_workspace_folder(workspace_id: str, depth: int = 1) -> dict:
     return _api_call("GET", path, params={"depth": depth}).json().get("data", {})
 
 
+async def get_workspace_folder_async(workspace_id: str, depth: int = 1) -> dict:
+    """Async REST read for the workspace folder tree."""
+    _require_workspace(workspace_id)
+    path = f"/api/workspace/{workspace_id}/folder"
+    return (
+        (await _api_call_async("GET", path, params={"depth": depth}))
+        .json()
+        .get("data", {})
+    )
+
+
 @mcp.tool(annotations=_READ)
 def get_database_fields(workspace_id: str, database_id: str) -> list:
     """Retrieves the fields/columns available in a database."""
@@ -2066,6 +2077,206 @@ async def appflowy_fetch(
         "kind must be one of: auto, self, workspaces, workspace_folder, "
         "database_fields, page"
     )
+
+
+def _folder_node_id(node: dict) -> str:
+    for key in ("view_id", "id", "page_id"):
+        if node.get(key):
+            return str(node[key])
+    return ""
+
+
+def _folder_node_name(node: dict, fallback: str) -> str:
+    for key in ("name", "view_name", "title"):
+        if node.get(key):
+            return str(node[key])
+    return fallback
+
+
+def _folder_node_children(node: dict) -> list[dict]:
+    children = []
+    for key in ("children", "items", "views"):
+        raw = node.get(key)
+        if isinstance(raw, list):
+            children.extend(child for child in raw if isinstance(child, dict))
+    return children
+
+
+def _find_folder_node(tree, view_id: str):
+    if isinstance(tree, dict):
+        if _folder_node_id(tree) == view_id:
+            return tree
+        for child in _folder_node_children(tree):
+            found = _find_folder_node(child, view_id)
+            if found is not None:
+                return found
+        for key, value in tree.items():
+            if key in {"children", "items", "views"}:
+                continue
+            if isinstance(value, (dict, list)):
+                found = _find_folder_node(value, view_id)
+                if found is not None:
+                    return found
+    elif isinstance(tree, list):
+        for child in tree:
+            found = _find_folder_node(child, view_id)
+            if found is not None:
+                return found
+    return None
+
+
+def _safe_export_path_segment(name: str) -> str:
+    clean = re.sub(r"[\\/\x00-\x1f]+", "-", name).strip(" .")
+    return clean or "untitled"
+
+
+APPFLOWY_EXPORT_MAX_DEPTH = 5
+APPFLOWY_EXPORT_MAX_LIMIT = 100
+APPFLOWY_EXPORT_MAX_WARNINGS = 25
+APPFLOWY_EXPORT_LOCATE_DEPTH = 4
+
+AppFlowyExportDepth = Annotated[int, Field(ge=0, le=APPFLOWY_EXPORT_MAX_DEPTH)]
+AppFlowyExportLimit = Annotated[int, Field(ge=1, le=APPFLOWY_EXPORT_MAX_LIMIT)]
+
+
+class AppFlowyExportInput(BaseModel):
+    workspace_id: str
+    view_id: str
+    depth: AppFlowyExportDepth = 0
+    limit: AppFlowyExportLimit = 50
+
+
+def _export_warning(message: str, **details) -> dict:
+    return {"message": message, **details}
+
+
+def _append_export_warning(warnings: list[dict], warning: dict) -> bool:
+    if len(warnings) >= APPFLOWY_EXPORT_MAX_WARNINGS:
+        return False
+    warnings.append(warning)
+    return True
+
+
+async def appflowy_export(
+    workspace_id: str,
+    view_id: str,
+    depth: AppFlowyExportDepth = 0,
+    limit: AppFlowyExportLimit = 50,
+) -> dict:
+    """Exports a page, and optionally its child pages, as Markdown entries.
+
+    Returns:
+      {"entries": [{"path": "Page.md", "id": "...", "markdown": "..."}],
+       "warnings": [...], "has_more": false}
+
+    depth=0 exports only `view_id`. depth=1 includes direct children found in the
+    workspace folder tree, depth=2 includes grandchildren, and so on. Database/table
+    views or unsupported blocks that cannot be opened as a document are reported as
+    warnings instead of aborting the whole export.
+    """
+    try:
+        params = AppFlowyExportInput(
+            workspace_id=workspace_id,
+            view_id=view_id,
+            depth=depth,
+            limit=limit,
+        )
+    except ValidationError as exc:
+        raise ValueError(str(exc)) from exc
+    workspace_id = params.workspace_id
+    view_id = params.view_id
+    depth = params.depth
+    limit = params.limit
+
+    _require_workspace(workspace_id)
+
+    # Locate the requested root with a fixed, bounded folder read; traversal below then
+    # follows only the located subtree and the requested export depth.
+    folder = (
+        await get_workspace_folder_async(
+            workspace_id, depth=APPFLOWY_EXPORT_LOCATE_DEPTH
+        )
+        if depth
+        else {}
+    )
+    root = _find_folder_node(folder, view_id) if folder else None
+    root_name = _folder_node_name(root, view_id) if isinstance(root, dict) else view_id
+    queue = [(view_id, _safe_export_path_segment(root_name), 0, root)]
+    entries = []
+    warnings = []
+    warnings_truncated = False
+    if depth and root is None:
+        _append_export_warning(
+            warnings,
+            _export_warning(
+                "target was not found in the bounded workspace folder tree; "
+                "exporting the requested page only",
+                id=view_id,
+                path="",
+                type="target_not_found",
+            ),
+        )
+    seen_paths = set()
+    has_more = False
+    attempted = 0
+
+    while queue:
+        current_id, current_path, current_depth, node = queue.pop(0)
+        if attempted >= limit:
+            has_more = True
+            break
+        attempted += 1
+
+        path = f"{current_path}.md"
+        suffix = 2
+        while path in seen_paths:
+            path = f"{current_path}-{suffix}.md"
+            suffix += 1
+        seen_paths.add(path)
+
+        try:
+            markdown = await get_page_markdown_async(workspace_id, current_id)
+            entries.append({"path": path, "id": current_id, "markdown": markdown})
+        except Exception:
+            if current_id == view_id:
+                raise
+            warnings_truncated = (
+                not _append_export_warning(
+                    warnings,
+                    _export_warning(
+                        "page could not be exported as Markdown",
+                        id=current_id,
+                        path=path,
+                        type="document_unavailable",
+                    ),
+                )
+                or warnings_truncated
+            )
+            continue
+
+        child_base_path = path.removesuffix(".md")
+        if current_depth >= depth or not isinstance(node, dict):
+            continue
+        for child in _folder_node_children(node):
+            child_id = _folder_node_id(child)
+            if not child_id:
+                continue
+            child_name = _safe_export_path_segment(_folder_node_name(child, child_id))
+            queue.append(
+                (
+                    child_id,
+                    f"{child_base_path}/{child_name}",
+                    current_depth + 1,
+                    child,
+                )
+            )
+
+    return {
+        "entries": entries,
+        "warnings": warnings,
+        "warnings_truncated": warnings_truncated,
+        "has_more": has_more,
+    }
 
 
 # Concurrent collab edits can transiently lose a write, so update_row_cells confirms
