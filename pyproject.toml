@@ -18,6 +18,7 @@ dependencies = [
     # collab decoding).
     "mcp>=1.13,<2",
     "httpx",
+    "pydantic",
     "python-dotenv",
     "fastapi",
     "uvicorn",
