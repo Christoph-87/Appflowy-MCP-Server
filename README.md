@@ -163,11 +163,20 @@ APPFLOWY_COMPAT_WORKSPACE_ID=... \
 python live_compatibility.py --output compatibility-report.json
 ```
 
-Optional reversible create/read/trash checks are disabled unless explicitly requested:
+Optional disposable mutation checks are disabled unless explicitly requested:
 
 ```bash
-APPFLOWY_COMPAT_PARENT_VIEW_ID=... python live_compatibility.py --run-reversible
+APPFLOWY_COMPAT_PARENT_VIEW_ID=... \
+APPFLOWY_COMPAT_DATABASE_ID=... \
+APPFLOWY_COMPAT_ROW_FIELD_ID=... \
+python live_compatibility.py --run-reversible
 ```
+
+Reversible mode creates a disposable page, verifies a collab document edit, trashes
+the page, and—when a database plus writable text field are available—creates a
+disposable row, verifies a collab cell edit, and hard-deletes that temporary row.
+`APPFLOWY_COMPAT_ROW_FIELD_ID` is optional when the harness can identify a primary or
+RichText field from the database schema.
 
 The report records sanitized response shapes. Successful live routes are classified
 as `live_validated`; failed or skipped routes keep their evidence basis separately

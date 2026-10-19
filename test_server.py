@@ -562,6 +562,7 @@ def test_live_compatibility_harness_read_only(monkeypatch):
                 build="revision",
                 workspace_id="ws-allowed",
                 database_id="",
+                row_field_id="",
                 document_id="",
                 parent_view_id="",
             )
@@ -724,6 +725,18 @@ def test_live_compatibility_harness_reversible_flag(monkeypatch):
         raise AssertionError(f"unexpected route {method} {path}")
 
     monkeypatch.setattr(server, "_api_call_async", fake_api_call)
+    monkeypatch.setattr(
+        server,
+        "replace_text",
+        lambda workspace_id, page_id, find, replace: "replaced in 1 block(s)",
+    )
+
+    async def fake_verify_document_text(workspace_id, view_id, expected):
+        return {"verified": True}
+
+    monkeypatch.setattr(
+        live_compatibility, "_verify_document_text", fake_verify_document_text
+    )
 
     report = asyncio.run(
         live_compatibility.run_compatibility_checks(
@@ -733,6 +746,7 @@ def test_live_compatibility_harness_reversible_flag(monkeypatch):
                 build="revision",
                 workspace_id="ws-allowed",
                 database_id="",
+                row_field_id="",
                 document_id="",
                 parent_view_id="parent-page",
                 run_reversible=True,
@@ -744,8 +758,103 @@ def test_live_compatibility_harness_reversible_flag(monkeypatch):
     names = [check["name"] for check in report["checks"]]
     assert "reversible_page_create" in names
     assert "reversible_page_read" in names
+    assert "reversible_collab_document_edit" in names
+    assert "reversible_collab_document_verify" in names
     assert "reversible_page_trash" in names
     assert ("POST", "/api/workspace/ws-allowed/page-view") in calls
+
+
+def test_live_compatibility_reversible_collab_and_row_checks(monkeypatch):
+    import asyncio
+    import json
+
+    import live_compatibility
+
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, data):
+            self._data = data
+
+        def json(self):
+            return {"data": self._data}
+
+    async def fake_api_call(method, path, **kwargs):
+        calls.append((method, path, kwargs.get("json")))
+        if path == "/api/workspace":
+            return FakeResponse([{"workspace_id": "ws-allowed"}])
+        if path == "/api/workspace/ws-allowed/folder":
+            return FakeResponse({"views": []})
+        if path == "/api/workspace/ws-allowed/database":
+            return FakeResponse([{"database_id": "db-1"}])
+        if path == "/api/workspace/ws-allowed/database/db-1/fields":
+            return FakeResponse(
+                [{"id": "field-1", "field_type": 0, "is_primary": True}]
+            )
+        if path == "/api/workspace/ws-allowed/database/db-1/row":
+            if method == "POST":
+                return FakeResponse("row-1")
+            return FakeResponse([])
+        if path == "/api/workspace/ws-allowed/page-view":
+            return FakeResponse({"view_id": "created-page"})
+        if path == "/api/workspace/ws-allowed/page-view/created-page":
+            return FakeResponse({"view_id": "created-page"})
+        if path == "/api/workspace/ws-allowed/page-view/created-page/move-to-trash":
+            return FakeResponse("")
+        raise AssertionError(f"unexpected route {method} {path}")
+
+    def fake_replace_text(workspace_id, page_id, find, replace):
+        calls.append(("COLLAB_DOCUMENT", page_id, (find, replace)))
+        return "replaced in 1 block(s)"
+
+    async def fake_markdown(workspace_id, page_id):
+        return "compatibility-after-marker"
+
+    def fake_update_row_cells(workspace_id, database_id, row_id, cells):
+        calls.append(("COLLAB_ROW", row_id, json.loads(cells)))
+        return row_id
+
+    def fake_delete_row(workspace_id, database_id, row_id):
+        calls.append(("DELETE_ROW", row_id, None))
+        return f"deleted row {row_id}"
+
+    async def fake_verify_document_text(workspace_id, view_id, expected):
+        assert expected.startswith("compatibility-after-")
+        return {"verified": True}
+
+    monkeypatch.setattr(server, "_api_call_async", fake_api_call)
+    monkeypatch.setattr(server, "replace_text", fake_replace_text)
+    monkeypatch.setattr(server, "get_page_markdown_async", fake_markdown)
+    monkeypatch.setattr(server, "update_row_cells", fake_update_row_cells)
+    monkeypatch.setattr(server, "delete_row", fake_delete_row)
+    monkeypatch.setattr(
+        live_compatibility, "_verify_document_text", fake_verify_document_text
+    )
+
+    report = asyncio.run(
+        live_compatibility.run_compatibility_checks(
+            live_compatibility.CompatibilityConfig(
+                deployment_type="self-hosted-docker",
+                version="0.18.5",
+                build="revision",
+                workspace_id="ws-allowed",
+                database_id="db-1",
+                row_field_id="",
+                document_id="",
+                parent_view_id="parent-page",
+                run_reversible=True,
+            )
+        )
+    )
+
+    assert report["summary"]["failed"] == 0
+    names = {check["name"] for check in report["checks"]}
+    assert "reversible_collab_document_edit" in names
+    assert "reversible_database_row_collab_edit" in names
+    assert "reversible_database_row_delete" in names
+    assert any(call[0] == "COLLAB_DOCUMENT" for call in calls)
+    assert any(call[0] == "COLLAB_ROW" for call in calls)
+    assert any(call[0] == "DELETE_ROW" for call in calls)
 
 
 def test_live_compatibility_refuses_ci(monkeypatch):
