@@ -1,0 +1,543 @@
+{
+  "base_url": "https://appflowy.boehler.uk",
+  "checks": [
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 294.1,
+      "evidence_basis": "current_web_observed",
+      "method": "GET",
+      "name": "auth_and_workspace_listing",
+      "ok": true,
+      "response_shape": {
+        "count": 1,
+        "item": {
+          "fields": {
+            "created_at": "str",
+            "database_storage_id": "str",
+            "icon": "str",
+            "member_count": "number",
+            "owner_email": "str",
+            "owner_name": "str",
+            "owner_uid": "number",
+            "workspace_id": "str",
+            "workspace_name": "str",
+            "workspace_type": "number"
+          },
+          "keys": [
+            "created_at",
+            "database_storage_id",
+            "icon",
+            "member_count",
+            "owner_email",
+            "owner_name",
+            "owner_uid",
+            "role",
+            "workspace_id",
+            "workspace_name",
+            "workspace_type"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "reversible": false,
+      "route": "/api/workspace"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 54.2,
+      "evidence_basis": "current_web_observed",
+      "method": "GET",
+      "name": "folder_traversal_depth_1",
+      "ok": true,
+      "response_shape": {
+        "fields": {
+          "folder_rid": "str",
+          "icon": "null",
+          "is_favorite": "bool",
+          "is_private": "bool",
+          "is_published": "bool",
+          "is_space": "bool",
+          "name": "str",
+          "parent_view_id": "null",
+          "prev_view_id": "null",
+          "view_id": "str"
+        },
+        "keys": [
+          "access_level",
+          "children",
+          "created_at",
+          "created_by",
+          "extra",
+          "folder_rid",
+          "has_children",
+          "icon",
+          "is_favorite",
+          "is_locked",
+          "is_private",
+          "is_published",
+          "is_space",
+          "last_edited_by",
+          "last_edited_time",
+          "layout",
+          "name",
+          "parent_view_id",
+          "prev_view_id",
+          "version"
+        ],
+        "type": "object"
+      },
+      "reversible": false,
+      "route": "/api/workspace/{workspace_id}/folder"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 52.7,
+      "evidence_basis": "current_web_observed",
+      "method": "GET",
+      "name": "database_discovery",
+      "ok": true,
+      "response_shape": {
+        "count": 2,
+        "item": {
+          "fields": {
+            "id": "str",
+            "views": {
+              "count": 1,
+              "item": "dict",
+              "type": "array"
+            }
+          },
+          "keys": [
+            "id",
+            "views"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "reversible": false,
+      "route": "/api/workspace/{workspace_id}/database"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 56.1,
+      "evidence_basis": "current_web_observed",
+      "method": "GET",
+      "name": "database_fields",
+      "ok": true,
+      "response_shape": {
+        "count": 11,
+        "item": {
+          "fields": {
+            "field_type": "str",
+            "field_type_id": "number",
+            "id": "str",
+            "is_primary": "bool",
+            "name": "str",
+            "type_option": {
+              "fields": {
+                "content": "dict"
+              },
+              "keys": [
+                "content"
+              ],
+              "type": "object"
+            }
+          },
+          "keys": [
+            "field_type",
+            "field_type_id",
+            "id",
+            "is_primary",
+            "name",
+            "type_option"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "reversible": false,
+      "route": "/api/workspace/{workspace_id}/database/{database_id}/fields"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 55.3,
+      "evidence_basis": "current_web_observed",
+      "method": "GET",
+      "name": "database_row_ids",
+      "ok": true,
+      "response_shape": {
+        "count": 220,
+        "item": {
+          "fields": {
+            "id": "str"
+          },
+          "keys": [
+            "id"
+          ],
+          "type": "object"
+        },
+        "type": "array"
+      },
+      "reversible": false,
+      "route": "/api/workspace/{workspace_id}/database/{database_id}/row"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 47.7,
+      "evidence_basis": "current_web_observed",
+      "method": "GET",
+      "name": "page_metadata",
+      "ok": true,
+      "response_shape": {
+        "fields": {
+          "data": {
+            "fields": {
+              "encoded_collab": {
+                "count": 1059,
+                "item": "int",
+                "type": "array"
+              },
+              "row_data": {
+                "fields": {},
+                "keys": [],
+                "type": "object"
+              }
+            },
+            "keys": [
+              "encoded_collab",
+              "row_data"
+            ],
+            "type": "object"
+          },
+          "last_editor": {
+            "fields": {
+              "avatar_url": "null",
+              "name": "str",
+              "uuid": "str"
+            },
+            "keys": [
+              "avatar_url",
+              "name",
+              "uuid"
+            ],
+            "type": "object"
+          },
+          "owner": {
+            "fields": {
+              "avatar_url": "null",
+              "name": "str",
+              "uuid": "str"
+            },
+            "keys": [
+              "avatar_url",
+              "name",
+              "uuid"
+            ],
+            "type": "object"
+          },
+          "view": {
+            "fields": {
+              "icon": "null",
+              "is_favorite": "bool",
+              "is_private": "bool",
+              "is_published": "bool",
+              "is_space": "bool",
+              "layout": "number",
+              "name": "str",
+              "parent_view_id": "str",
+              "prev_view_id": "str",
+              "view_id": "str"
+            },
+            "keys": [
+              "access_level",
+              "children",
+              "created_at",
+              "created_by",
+              "extra",
+              "has_children",
+              "icon",
+              "is_favorite",
+              "is_locked",
+              "is_private",
+              "is_published",
+              "is_space",
+              "last_edited_by",
+              "last_edited_time",
+              "layout",
+              "name",
+              "parent_view_id",
+              "prev_view_id",
+              "version",
+              "view_id"
+            ],
+            "type": "object"
+          }
+        },
+        "keys": [
+          "data",
+          "last_editor",
+          "owner",
+          "view"
+        ],
+        "type": "object"
+      },
+      "reversible": false,
+      "route": "/api/workspace/{workspace_id}/page-view/{view_id}"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 43.8,
+      "evidence_basis": "current_web_observed",
+      "method": "GET",
+      "name": "collab_document_markdown_read",
+      "ok": true,
+      "response_shape": "str",
+      "reversible": false,
+      "route": "/api/workspace/v1/{workspace_id}/collab/{object_id}"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 66.0,
+      "evidence_basis": "current_web_observed",
+      "method": "POST",
+      "name": "reversible_page_create",
+      "ok": true,
+      "response_shape": {
+        "fields": {
+          "database_id": "null",
+          "view_id": "str"
+        },
+        "keys": [
+          "database_id",
+          "view_id"
+        ],
+        "type": "object"
+      },
+      "reversible": true,
+      "route": "/api/workspace/{workspace_id}/page-view"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 50.1,
+      "evidence_basis": "current_web_observed",
+      "method": "GET",
+      "name": "reversible_page_read",
+      "ok": true,
+      "response_shape": {
+        "fields": {
+          "data": {
+            "fields": {
+              "encoded_collab": {
+                "count": 627,
+                "item": "int",
+                "type": "array"
+              },
+              "row_data": {
+                "fields": {},
+                "keys": [],
+                "type": "object"
+              }
+            },
+            "keys": [
+              "encoded_collab",
+              "row_data"
+            ],
+            "type": "object"
+          },
+          "last_editor": {
+            "fields": {
+              "avatar_url": "null",
+              "name": "str",
+              "uuid": "str"
+            },
+            "keys": [
+              "avatar_url",
+              "name",
+              "uuid"
+            ],
+            "type": "object"
+          },
+          "owner": {
+            "fields": {
+              "avatar_url": "null",
+              "name": "str",
+              "uuid": "str"
+            },
+            "keys": [
+              "avatar_url",
+              "name",
+              "uuid"
+            ],
+            "type": "object"
+          },
+          "view": {
+            "fields": {
+              "icon": "null",
+              "is_favorite": "bool",
+              "is_private": "bool",
+              "is_published": "bool",
+              "is_space": "bool",
+              "layout": "number",
+              "name": "str",
+              "parent_view_id": "str",
+              "prev_view_id": "null",
+              "view_id": "str"
+            },
+            "keys": [
+              "access_level",
+              "children",
+              "created_at",
+              "created_by",
+              "extra",
+              "has_children",
+              "icon",
+              "is_favorite",
+              "is_locked",
+              "is_private",
+              "is_published",
+              "is_space",
+              "last_edited_by",
+              "last_edited_time",
+              "layout",
+              "name",
+              "parent_view_id",
+              "prev_view_id",
+              "version",
+              "view_id"
+            ],
+            "type": "object"
+          }
+        },
+        "keys": [
+          "data",
+          "last_editor",
+          "owner",
+          "view"
+        ],
+        "type": "object"
+      },
+      "reversible": true,
+      "route": "/api/workspace/{workspace_id}/page-view/{view_id}"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 240.5,
+      "evidence_basis": "current_web_observed",
+      "method": "POST",
+      "name": "reversible_collab_document_edit",
+      "ok": true,
+      "response_shape": "str",
+      "reversible": true,
+      "route": "/api/workspace/v1/{workspace_id}/collab/{object_id}/web-update"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 47.2,
+      "evidence_basis": "current_web_observed",
+      "method": "GET",
+      "name": "reversible_collab_document_verify",
+      "ok": true,
+      "response_shape": {
+        "fields": {
+          "verified": "bool"
+        },
+        "keys": [
+          "verified"
+        ],
+        "type": "object"
+      },
+      "reversible": true,
+      "route": "/api/workspace/v1/{workspace_id}/collab/{object_id}"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": true,
+      "duration_ms": 63.9,
+      "evidence_basis": "current_web_observed",
+      "method": "POST",
+      "name": "reversible_page_trash",
+      "ok": true,
+      "response_shape": "null",
+      "reversible": true,
+      "route": "/api/workspace/{workspace_id}/page-view/{view_id}/move-to-trash"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 65.6,
+      "evidence_basis": "current_web_observed",
+      "method": "POST",
+      "name": "reversible_database_row_create",
+      "ok": true,
+      "response_shape": "str",
+      "reversible": true,
+      "route": "/api/workspace/{workspace_id}/database/{database_id}/row"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": false,
+      "duration_ms": 342.3,
+      "evidence_basis": "current_web_observed",
+      "method": "POST",
+      "name": "reversible_database_row_collab_edit",
+      "ok": true,
+      "response_shape": "str",
+      "reversible": true,
+      "route": "/api/workspace/v1/{workspace_id}/collab/{object_id}/web-update"
+    },
+    {
+      "classification": "live_validated",
+      "destructive": true,
+      "duration_ms": 503.5,
+      "evidence_basis": "current_web_observed",
+      "method": "DELETE",
+      "name": "reversible_database_row_delete",
+      "ok": true,
+      "response_shape": {
+        "fields": {
+          "removed_view_orders": "number",
+          "row_id": "str",
+          "verified": "bool"
+        },
+        "keys": [
+          "removed_view_orders",
+          "row_id",
+          "verified"
+        ],
+        "type": "object"
+      },
+      "reversible": true,
+      "route": "/api/workspace/{workspace_id}/collab/{object_id}"
+    }
+  ],
+  "deployment": {
+    "build": "not-exposed-by-health-endpoint",
+    "type": "self-hosted-docker",
+    "version": "latest"
+  },
+  "generated_at": "2026-10-23T05:00:22+00:00",
+  "modes": {
+    "live_credentials_in_ci": false,
+    "read_only_default": true,
+    "reversible_checks_enabled": true
+  },
+  "schema": "appflowy-mcp.live-compatibility-report.v1",
+  "summary": {
+    "failed": 0,
+    "passed": 15,
+    "skipped": 0
+  }
+}

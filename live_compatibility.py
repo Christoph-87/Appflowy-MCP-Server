@@ -51,6 +51,7 @@ class CompatibilityConfig:
     database_id: str
     document_id: str
     parent_view_id: str
+    row_field_id: str = ""
     run_reversible: bool = False
 
     @classmethod
@@ -63,6 +64,7 @@ class CompatibilityConfig:
             build=os.environ.get("APPFLOWY_COMPAT_BUILD", "unspecified"),
             workspace_id=os.environ.get("APPFLOWY_COMPAT_WORKSPACE_ID", ""),
             database_id=os.environ.get("APPFLOWY_COMPAT_DATABASE_ID", ""),
+            row_field_id=os.environ.get("APPFLOWY_COMPAT_ROW_FIELD_ID", ""),
             document_id=os.environ.get("APPFLOWY_COMPAT_DOCUMENT_ID", ""),
             parent_view_id=os.environ.get("APPFLOWY_COMPAT_PARENT_VIEW_ID", ""),
             run_reversible=run_reversible,
@@ -248,6 +250,27 @@ def _extract_document_id(folder: Any, preferred: str) -> str:
     return ""
 
 
+def _extract_row_field_id(fields: Any, preferred: str) -> str:
+    """Pick a writable text field for a disposable row-edit check."""
+    if preferred:
+        return preferred
+    candidates = list(_iter_nodes(fields))
+    for node in candidates:
+        field_id = node.get("id") or node.get("field_id") or node.get("fieldId")
+        if isinstance(field_id, str) and field_id and node.get("is_primary") is True:
+            return field_id
+    for node in candidates:
+        field_id = node.get("id") or node.get("field_id") or node.get("fieldId")
+        field_type = node.get("field_type", node.get("fieldType", node.get("type")))
+        if (
+            isinstance(field_id, str)
+            and field_id
+            and field_type in (0, "0", "rich_text")
+        ):
+            return field_id
+    return ""
+
+
 async def _api_json(method: str, path: str, **kwargs) -> Any:
     return (await server._api_call_async(method, path, **kwargs)).json().get("data")
 
@@ -283,8 +306,9 @@ async def run_compatibility_checks(config: CompatibilityConfig) -> dict[str, Any
         operation=lambda: _api_json("GET", f"/api/workspace/{workspace_id}/database"),
     )
     database_id = _extract_database_id(databases, config.database_id)
+    database_fields = None
     if database_id:
-        await recorder.record(
+        database_fields = await recorder.record(
             name="database_fields",
             method="GET",
             route="/api/workspace/{workspace_id}/database/{database_id}/fields",
@@ -329,7 +353,13 @@ async def run_compatibility_checks(config: CompatibilityConfig) -> dict[str, Any
         )
 
     if config.run_reversible:
-        await _run_reversible_checks(recorder, config, workspace_id)
+        await _run_reversible_checks(
+            recorder,
+            config,
+            workspace_id,
+            database_id=database_id,
+            database_fields=database_fields,
+        )
     else:
         recorder.skip(
             "reversible_create_read_trash",
@@ -340,7 +370,12 @@ async def run_compatibility_checks(config: CompatibilityConfig) -> dict[str, Any
 
 
 async def _run_reversible_checks(
-    recorder: CompatibilityRecorder, config: CompatibilityConfig, workspace_id: str
+    recorder: CompatibilityRecorder,
+    config: CompatibilityConfig,
+    workspace_id: str,
+    *,
+    database_id: str,
+    database_fields: Any,
 ) -> None:
     if not config.parent_view_id:
         recorder.skip(
@@ -349,12 +384,23 @@ async def _run_reversible_checks(
         )
         return
 
-    page_name = f"compatibility-smoke-{uuid.uuid4().hex[:8]}"
+    marker = uuid.uuid4().hex[:12]
+    page_name = f"compatibility-smoke-{marker[:8]}"
+    initial_text = f"compatibility-before-{marker}"
+    updated_text = f"compatibility-after-{marker}"
     body = {
         "parent_view_id": config.parent_view_id,
         "layout": 0,
         "name": page_name,
-        "page_data": {"type": "page", "children": []},
+        "page_data": {
+            "type": "page",
+            "children": [
+                {
+                    "type": "paragraph",
+                    "data": {"delta": [{"insert": initial_text}]},
+                }
+            ],
+        },
     }
 
     created = await recorder.record(
@@ -384,6 +430,26 @@ async def _run_reversible_checks(
         ),
     )
     await recorder.record(
+        name="reversible_collab_document_edit",
+        method="POST",
+        route=server._COLLAB_WEB_UPDATE_ROUTE,
+        reversible=True,
+        operation=lambda: asyncio.to_thread(
+            server.replace_text,
+            workspace_id,
+            view_id,
+            initial_text,
+            updated_text,
+        ),
+    )
+    await recorder.record(
+        name="reversible_collab_document_verify",
+        method="GET",
+        route="/api/workspace/v1/{workspace_id}/collab/{object_id}",
+        reversible=True,
+        operation=lambda: _verify_document_text(workspace_id, view_id, updated_text),
+    )
+    await recorder.record(
         name="reversible_page_trash",
         method="POST",
         route="/api/workspace/{workspace_id}/page-view/{view_id}/move-to-trash",
@@ -395,6 +461,104 @@ async def _run_reversible_checks(
             json={},
         ),
     )
+
+    await _run_reversible_row_check(
+        recorder,
+        config,
+        workspace_id,
+        database_id=database_id,
+        database_fields=database_fields,
+        marker=marker,
+    )
+
+
+async def _verify_document_text(
+    workspace_id: str, view_id: str, expected: str
+) -> dict[str, bool]:
+    markdown = await server.get_page_markdown_async(workspace_id, view_id)
+    if expected not in markdown:
+        raise RuntimeError("Collab document edit was not visible on read-back")
+    return {"verified": True}
+
+
+async def _run_reversible_row_check(
+    recorder: CompatibilityRecorder,
+    config: CompatibilityConfig,
+    workspace_id: str,
+    *,
+    database_id: str,
+    database_fields: Any,
+    marker: str,
+) -> None:
+    if not database_id:
+        recorder.skip(
+            "reversible_database_row_edit",
+            "Set APPFLOWY_COMPAT_DATABASE_ID to enable the disposable row check.",
+        )
+        return
+    field_id = _extract_row_field_id(database_fields, config.row_field_id)
+    if not field_id:
+        recorder.skip(
+            "reversible_database_row_edit",
+            "Set APPFLOWY_COMPAT_ROW_FIELD_ID to a writable text field.",
+        )
+        return
+
+    initial_value = f"compatibility-row-before-{marker}"
+    updated_value = f"compatibility-row-after-{marker}"
+    row = await recorder.record(
+        name="reversible_database_row_create",
+        method="POST",
+        route="/api/workspace/{workspace_id}/database/{database_id}/row",
+        reversible=True,
+        operation=lambda: _api_json(
+            "POST",
+            f"/api/workspace/{workspace_id}/database/{database_id}/row",
+            json={"cells": {field_id: initial_value}},
+        ),
+    )
+    row_id = _extract_created_id(row)
+    if not row_id:
+        recorder.skip(
+            "reversible_database_row_update_delete",
+            "Create did not return a row id; refusing follow-up collab checks.",
+        )
+        return
+
+    await recorder.record(
+        name="reversible_database_row_collab_edit",
+        method="POST",
+        route=server._COLLAB_WEB_UPDATE_ROUTE,
+        reversible=True,
+        operation=lambda: asyncio.to_thread(
+            server.update_row_cells,
+            workspace_id,
+            database_id,
+            row_id,
+            json.dumps({field_id: updated_value}),
+        ),
+    )
+    await recorder.record(
+        name="reversible_database_row_delete",
+        method="DELETE",
+        route="/api/workspace/{workspace_id}/collab/{object_id}",
+        destructive=True,
+        reversible=True,
+        operation=lambda: asyncio.to_thread(
+            server._delete_row_strict, workspace_id, database_id, row_id
+        ),
+    )
+
+
+def _extract_created_id(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("row_id", "rowId", "id"):
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+    return ""
 
 
 def _report(
@@ -476,8 +640,9 @@ def main(argv: list[str] | None = None) -> int:
         "--run-reversible",
         action="store_true",
         help=(
-            "Enable reversible create/read/trash checks. Requires "
-            "APPFLOWY_COMPAT_PARENT_VIEW_ID."
+            "Enable disposable page create/read/collab-edit/trash checks and, "
+            "when configured, database row create/collab-edit/delete checks. "
+            "Requires APPFLOWY_COMPAT_PARENT_VIEW_ID."
         ),
     )
     parser.add_argument(

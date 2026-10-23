@@ -580,6 +580,11 @@ async def _collab_doc_async(workspace_id: str, object_id: str, collab_type: int)
     return doc
 
 
+_COLLAB_WEB_UPDATE_ROUTE = (
+    "/api/workspace/v1/{workspace_id}/collab/{object_id}/web-update"
+)
+
+
 def _collab_web_update(
     workspace_id: str, object_id: str, doc: Doc, state_vector: bytes, collab_type: int
 ) -> None:
@@ -587,7 +592,7 @@ def _collab_web_update(
     update = doc.get_update(state_vector)
     _api_call(
         "POST",
-        f"/api/workspace/v1/{workspace_id}/collab/{object_id}/web-update",
+        _COLLAB_WEB_UPDATE_ROUTE.format(workspace_id=workspace_id, object_id=object_id),
         json={"doc_state": list(update), "collab_type": collab_type},
     )
 
@@ -2382,6 +2387,49 @@ def delete_row(workspace_id: str, database_id: str, row_id: str) -> str:
     except RuntimeError:
         pass
     return f"deleted row {row_id} (removed from {removed} view order(s))"
+
+
+def _delete_row_strict(workspace_id: str, database_id: str, row_id: str) -> dict:
+    """Delete a row and prove both authoritative cleanup steps completed.
+
+    This is intentionally separate from the public ``delete_row`` MCP tool. The
+    public tool retains its historical best-effort semantics for deleting the row
+    collab, while compatibility validation needs failures to remain observable.
+    """
+    _require_workspace(workspace_id)
+    doc = _collab_doc(workspace_id, database_id, 1)
+    views = doc.get("data", type=Map)["database"]["views"]
+    sv = doc.get_state()
+    removed = 0
+    with doc.transaction():
+        for vid in list(views.keys()):
+            row_orders = views[vid]["row_orders"]
+            for i in reversed(range(len(row_orders))):
+                if row_orders[i]["id"] == row_id:
+                    del row_orders[i]
+                    removed += 1
+    if removed:
+        _collab_web_update(workspace_id, database_id, doc, sv, 1)
+
+    verified = _collab_doc(workspace_id, database_id, 1)
+    verified_views = verified.get("data", type=Map)["database"]["views"]
+    if any(
+        order["id"] == row_id
+        for vid in list(verified_views.keys())
+        for order in verified_views[vid]["row_orders"]
+    ):
+        raise RuntimeError("row remained in database view order after cleanup")
+
+    _api_call(
+        "DELETE",
+        f"/api/workspace/{workspace_id}/collab/{row_id}",
+        json={
+            "object_id": row_id,
+            "workspace_id": workspace_id,
+            "collab_type": _ROW_COLLAB,
+        },
+    )
+    return {"row_id": row_id, "removed_view_orders": removed, "verified": True}
 
 
 @mcp.tool(annotations=_CREATE)
