@@ -432,7 +432,7 @@ async def _run_reversible_checks(
     await recorder.record(
         name="reversible_collab_document_edit",
         method="POST",
-        route="/api/workspace/v1/{workspace_id}/collab/{object_id}",
+        route=server._COLLAB_WEB_UPDATE_ROUTE,
         reversible=True,
         operation=lambda: asyncio.to_thread(
             server.replace_text,
@@ -528,7 +528,7 @@ async def _run_reversible_row_check(
     await recorder.record(
         name="reversible_database_row_collab_edit",
         method="POST",
-        route="/api/workspace/v1/{workspace_id}/collab/{object_id}",
+        route=server._COLLAB_WEB_UPDATE_ROUTE,
         reversible=True,
         operation=lambda: asyncio.to_thread(
             server.update_row_cells,
@@ -545,7 +545,7 @@ async def _run_reversible_row_check(
         destructive=True,
         reversible=True,
         operation=lambda: asyncio.to_thread(
-            server.delete_row, workspace_id, database_id, row_id
+            server._delete_row_strict, workspace_id, database_id, row_id
         ),
     )
 

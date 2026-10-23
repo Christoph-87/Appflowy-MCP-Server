@@ -14,6 +14,30 @@ from fastapi.testclient import TestClient
 import server
 
 
+def _database_doc_with_rows(*row_ids):
+    from pycrdt import Array, Doc, Map
+
+    doc = Doc()
+    root = doc.get("data", type=Map)
+    with doc.transaction():
+        root["database"] = Map(
+            {
+                "views": Map(
+                    {
+                        "view-1": Map(
+                            {
+                                "row_orders": Array(
+                                    [Map({"id": row_id}) for row_id in row_ids]
+                                )
+                            }
+                        )
+                    }
+                )
+            }
+        )
+    return doc
+
+
 def test_agent_guide_resource():
     # The full guide is served as an MCP resource; the file must resolve + load.
     guide = server._agent_guide_md()
@@ -104,6 +128,28 @@ def test_collab_doc_state_tolerates_shapes():
     # unknown shape -> loud error that names the keys (never a bare KeyError)
     with pytest.raises(RuntimeError, match="doc_state"):
         b({"weird": {"nope": 1}})
+
+
+def test_collab_web_update_uses_reported_route(monkeypatch):
+    from pycrdt import Doc
+
+    calls = []
+    doc = Doc()
+    state_vector = doc.get_state()
+    monkeypatch.setattr(
+        server,
+        "_api_call",
+        lambda method, path, **kwargs: calls.append((method, path, kwargs)),
+    )
+
+    server._collab_web_update("ws-1", "object-1", doc, state_vector, 4)
+
+    assert calls[0][0:2] == (
+        "POST",
+        server._COLLAB_WEB_UPDATE_ROUTE.format(
+            workspace_id="ws-1", object_id="object-1"
+        ),
+    )
 
 
 def test_add_blocks_batch_insert():
@@ -816,7 +862,7 @@ def test_live_compatibility_reversible_collab_and_row_checks(monkeypatch):
 
     def fake_delete_row(workspace_id, database_id, row_id):
         calls.append(("DELETE_ROW", row_id, None))
-        return f"deleted row {row_id}"
+        return {"row_id": row_id, "verified": True}
 
     async def fake_verify_document_text(workspace_id, view_id, expected):
         assert expected.startswith("compatibility-after-")
@@ -826,7 +872,7 @@ def test_live_compatibility_reversible_collab_and_row_checks(monkeypatch):
     monkeypatch.setattr(server, "replace_text", fake_replace_text)
     monkeypatch.setattr(server, "get_page_markdown_async", fake_markdown)
     monkeypatch.setattr(server, "update_row_cells", fake_update_row_cells)
-    monkeypatch.setattr(server, "delete_row", fake_delete_row)
+    monkeypatch.setattr(server, "_delete_row_strict", fake_delete_row)
     monkeypatch.setattr(
         live_compatibility, "_verify_document_text", fake_verify_document_text
     )
@@ -855,6 +901,144 @@ def test_live_compatibility_reversible_collab_and_row_checks(monkeypatch):
     assert any(call[0] == "COLLAB_DOCUMENT" for call in calls)
     assert any(call[0] == "COLLAB_ROW" for call in calls)
     assert any(call[0] == "DELETE_ROW" for call in calls)
+
+    write_routes = {
+        check["route"]
+        for check in report["checks"]
+        if check["name"]
+        in {"reversible_collab_document_edit", "reversible_database_row_collab_edit"}
+    }
+    assert write_routes == {
+        "/api/workspace/v1/{workspace_id}/collab/{object_id}/web-update"
+    }
+
+
+def test_live_compatibility_row_cleanup_failure_is_reported(monkeypatch):
+    import asyncio
+
+    import live_compatibility
+
+    recorder = live_compatibility.CompatibilityRecorder()
+
+    monkeypatch.setattr(server, "update_row_cells", lambda *args: "row-1")
+    monkeypatch.setattr(
+        server,
+        "_delete_row_strict",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("AppFlowy API 403")),
+    )
+    monkeypatch.setattr(
+        live_compatibility,
+        "_api_json",
+        lambda *args, **kwargs: asyncio.sleep(0, result={"row_id": "row-1"}),
+    )
+
+    asyncio.run(
+        live_compatibility._run_reversible_row_check(
+            recorder,
+            live_compatibility.CompatibilityConfig(
+                "self-hosted", "version", "build", "ws", "db", "", "parent"
+            ),
+            "ws",
+            database_id="db",
+            database_fields=[{"id": "field-1", "field_type": 0}],
+            marker="marker",
+        )
+    )
+
+    cleanup = next(
+        check
+        for check in recorder.checks
+        if check["name"] == "reversible_database_row_delete"
+    )
+    assert cleanup["classification"] == live_compatibility.FAILED
+    assert cleanup["ok"] is False
+    assert cleanup["error"]["http_status"] == "403"
+
+
+def test_live_compatibility_row_cleanup_runs_after_edit_failure(monkeypatch):
+    import asyncio
+
+    import live_compatibility
+
+    recorder = live_compatibility.CompatibilityRecorder()
+    cleanup_calls = []
+    monkeypatch.setattr(
+        server,
+        "update_row_cells",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("edit failed")),
+    )
+    monkeypatch.setattr(
+        server,
+        "_delete_row_strict",
+        lambda *args: cleanup_calls.append(args) or {"verified": True},
+    )
+    monkeypatch.setattr(
+        live_compatibility,
+        "_api_json",
+        lambda *args, **kwargs: asyncio.sleep(0, result={"row_id": "row-1"}),
+    )
+
+    asyncio.run(
+        live_compatibility._run_reversible_row_check(
+            recorder,
+            live_compatibility.CompatibilityConfig(
+                "self-hosted", "version", "build", "ws", "db", "", "parent"
+            ),
+            "ws",
+            database_id="db",
+            database_fields=[{"id": "field-1", "field_type": 0}],
+            marker="marker",
+        )
+    )
+
+    assert cleanup_calls
+    assert (
+        next(
+            check
+            for check in recorder.checks
+            if check["name"] == "reversible_database_row_collab_edit"
+        )["classification"]
+        == live_compatibility.FAILED
+    )
+    assert (
+        next(
+            check
+            for check in recorder.checks
+            if check["name"] == "reversible_database_row_delete"
+        )["classification"]
+        == live_compatibility.LIVE_VALIDATED
+    )
+
+
+def test_strict_row_cleanup_reports_rejected_collab_delete(monkeypatch):
+    doc = _database_doc_with_rows("row-1")
+    monkeypatch.setattr(server, "_collab_doc", lambda *args: doc)
+    monkeypatch.setattr(server, "_collab_web_update", lambda *args: None)
+
+    def reject_delete(*args, **kwargs):
+        raise RuntimeError("AppFlowy API 403")
+
+    monkeypatch.setattr(server, "_api_call", reject_delete)
+
+    with pytest.raises(RuntimeError, match="403"):
+        server._delete_row_strict("ws-allowed", "db-1", "row-1")
+
+
+def test_strict_row_cleanup_reports_unsuccessful_view_removal(monkeypatch):
+    before = _database_doc_with_rows("row-1")
+    authoritative = _database_doc_with_rows("row-1")
+    docs = iter((before, authoritative))
+    monkeypatch.setattr(server, "_collab_doc", lambda *args: next(docs))
+    monkeypatch.setattr(server, "_collab_web_update", lambda *args: None)
+    delete_calls = []
+    monkeypatch.setattr(
+        server, "_api_call", lambda *args, **kwargs: delete_calls.append(args)
+    )
+
+    with pytest.raises(RuntimeError, match="remained in database view order"):
+        server._delete_row_strict("ws-allowed", "db-1", "row-1")
+
+    assert delete_calls == []
 
 
 def test_live_compatibility_refuses_ci(monkeypatch):
